@@ -1,0 +1,137 @@
+# Posts every published release's Android APKs to Mizan's Telegram channel,
+# so users get the latest version by itself. This repository is public and
+# holds no code, so its Actions do not spend the private repository's
+# minutes.
+#
+# The post: the main APK (arm64-v8a) with the release's text (its notes, in
+# Arabic) as its description, then the APK for older phones (armeabi-v7a)
+# with a short line. Notes longer than a description may be (1024
+# characters) go first as a message of their own. A pre-release is never
+# posted.
+#
+# Run by hand: "dry_run" (the default) only checks that the bot and the
+# channel answer, and posts nothing; with dry_run off it posts the given tag.
+#
+# Needs two repository secrets (Settings → Secrets and variables → Actions):
+#   TELEGRAM_BOT_TOKEN   the bot's token from @BotFather
+#   TELEGRAM_CHANNEL_ID  the channel, e.g. @mizan_updates (the bot is an admin
+#                        of it), or a private channel's numeric id
+#
+# A bot may upload files up to 50 MB, so the per-ABI APKs are posted, not the
+# universal one.
+name: Telegram release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only check the bot and the channel; post nothing
+        type: boolean
+        default: true
+      tag:
+        description: Release tag to post when dry_run is off (e.g. v2.8.1)
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-release-${{ github.event.release.tag_name || inputs.tag || 'check' }}
+
+jobs:
+  post:
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      GH_TOKEN: ${{ github.token }}
+      BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      CHANNEL: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+    steps:
+      - name: Check the secrets
+        run: |
+          if [ -z "$BOT_TOKEN" ] || [ -z "$CHANNEL" ]; then
+            echo "::error::Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID in the repository's secrets."
+            exit 1
+          fi
+
+      - name: Check the bot and the channel (posts nothing)
+        if: env.DRY_RUN == 'true'
+        run: |
+          set -euo pipefail
+          API="https://api.telegram.org/bot${BOT_TOKEN}"
+          me="$(curl -sS "$API/getMe")"
+          printf '%s' "$me" | grep -q '"ok":true' || { echo "::error::The bot token was refused."; exit 1; }
+          chat="$(curl -sS --data-urlencode "chat_id=$CHANNEL" "$API/getChat")"
+          printf '%s' "$chat" | grep -q '"ok":true' || { echo "::error::The bot cannot see the channel: $(printf '%s' "$chat" | head -c 200)"; exit 1; }
+          echo "The bot and the channel answer. Nothing was posted."
+
+      - name: Download the APKs and the notes
+        if: env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          if [ -z "$TAG" ]; then
+            echo "::error::Give the tag to post."
+            exit 1
+          fi
+          mkdir -p out
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir out \
+            --pattern '*-arm64-v8a.apk' --pattern '*-armeabi-v7a.apk'
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > out/notes.txt
+          ls -l out
+
+      - name: Post to Telegram
+        if: env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          # Lengths in characters, not bytes (Arabic letters are two bytes).
+          export LC_ALL=C.UTF-8
+          VERSION="${TAG#v}"
+          TEXT="$(cat out/notes.txt)"
+          if [ -z "$TEXT" ]; then
+            TEXT="ميزان ${VERSION} متاح الآن · لأغلب الأجهزة الحديثة"
+          fi
+          API="https://api.telegram.org/bot${BOT_TOKEN}"
+
+          # Telegram's answer is checked; the token never appears in the log.
+          send() {
+            local out
+            out="$(curl -sS "$@")"
+            if ! printf '%s' "$out" | grep -q '"ok":true'; then
+              echo "::error::Telegram refused: $(printf '%s' "$out" | head -c 300)"
+              exit 1
+            fi
+          }
+
+          # --form-string: a value starting with @ (the channel) is text, not
+          # a file to read; only the document is a file.
+          post_file() {
+            send "$API/sendDocument" --form-string "chat_id=$CHANNEL" \
+              -F "document=@$1" --form-string "caption=$2"
+          }
+
+          main="$(ls out/*-arm64-v8a.apk 2>/dev/null | head -n 1 || true)"
+          older="$(ls out/*-armeabi-v7a.apk 2>/dev/null | head -n 1 || true)"
+          if [ -z "$main" ] && [ -z "$older" ]; then
+            echo "::error::The release has no per-ABI APKs."
+            exit 1
+          fi
+
+          # What's new rides on the main file, unless it is too long for a
+          # description.
+          CAPTION="$TEXT"
+          if [ "${#TEXT}" -gt 1000 ]; then
+            send "$API/sendMessage" --data-urlencode "chat_id=$CHANNEL" \
+              --data-urlencode "text=$TEXT" -d disable_web_page_preview=true
+            CAPTION="ميزان ${VERSION} · لأغلب الأجهزة الحديثة"
+          fi
+
+          if [ -n "$main" ]; then
+            post_file "$main" "$CAPTION"
+          fi
+          if [ -n "$older" ]; then
+            post_file "$older" "ميزان ${VERSION} · للأجهزة القديمة"
+          fi
