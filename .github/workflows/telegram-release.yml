@@ -1,7 +1,7 @@
 # Posts every published release's Android APKs to Mizan's Telegram channel,
 # so users get the latest version by itself. This repository is public and
 # holds no code, so its Actions do not spend the private repository's
-# minutes.
+# minutes (a public repository's standard runners are free).
 #
 # The post: the main APK (arm64-v8a) with the release's text (its notes, in
 # Arabic) as its description, then the APK for older phones (armeabi-v7a)
